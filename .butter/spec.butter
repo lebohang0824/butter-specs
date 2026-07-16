@@ -1,3 +1,175 @@
-app butter_specs
-description "Butter specification"
-version "0.1.0"
+# backend.butter
+app ButterBackend
+description "Butter Cloud Core Backend API & GitOps Engine"
+version "1.16.0"
+
+endpoint GetWorkspaceState
+  description "Retrieves the currently cached specification AST and directory tree layout"
+  route "/api/v1/workspace/:project_id"
+  method "GET"
+
+  params
+    param project_id
+      type string
+      required true
+
+  responses
+    response WorkspaceState
+      field project_id
+        type string
+      field file_tree
+        type string
+      field spec_ast
+        type string
+    response ClientError
+      field error
+        type string
+
+  actions
+    action "Resolve user credentials and active organization boundaries"
+    action "Query PostgreSQL for the project's cached AST map"
+    action "Format the file directory tree corresponding to files inside /.butter/"
+
+  returns
+    return 200 WorkspaceState
+    return 404 ClientError | if "Project does not exist"
+    return 401 ClientError | if "User is unauthorized to access this workspace"
+
+endpoint ProposeWorkspaceChanges
+  description "Accepts updated specifications and generates a secure GitHub Pull Request"
+  route "/api/v1/propose"
+  method "POST"
+
+  params
+    param project_id
+      type string
+      required true
+    param user_id
+      type string
+      required true
+    param target_file
+      type string
+      required true
+    param plaintext_content
+      type string
+      required true
+
+  responses
+    response ProposalSuccess
+      field branch_name
+        type string
+      field pr_url
+        type string
+      field pr_number
+        type int
+    response ClientError
+      field error
+        type string
+
+  actions
+    action "Authenticate and authorize the proposing user"
+    action "Perform strict sandboxing checks on target_file path"
+      enforce "Target path must start strictly with '/.butter/'"
+      enforce "Target path must end with '.butter'"
+      enforce "Target path must not contain path traversal characters (e.g., '..')"
+    action "Verify structural validity of plaintext_content using the internal compiler checker"
+    action "Request ephemeral installation token from GitHub App API"
+    action "Acquire the latest main branch commit SHA"
+    action "Create temporary Git branch 'butter/proposal-[timestamp]'"
+    action "Push serialized plaintext specification modifications directly to Git"
+    action "Generate a summary Markdown changelog of structural changes"
+    action "Create a Pull Request matching the modified specifications"
+
+  returns
+    return 201 ProposalSuccess
+    return 400 ClientError | if "Path sandbox violation detected"
+    return 422 ClientError | if "Syntax verification failed"
+    return 401 ClientError | if "User lacks write access permissions"
+
+endpoint GithubWebhookHandler
+  description "Receives and validates push, installation, and installation_repositories payloads from the GitHub App"
+  route "/api/v1/webhooks/github"
+  method "POST"
+
+  params
+    param signature_header
+      type string
+      required true
+    param webhook_payload
+      type string
+      required true
+
+  responses
+    response WebhookEnqueued
+      field job_id
+        type string
+      field status
+        type string
+    response WebhookIgnored
+      field status
+        type string
+    response SignatureError
+      field error
+        type string
+
+  actions
+    action "Verify incoming X-Hub-Signature-256 header using SHA256 HMAC secret"
+    action "Route to handler based on X-GitHub-Event header value"
+    action "Parse installation event: upsert project row with installation_id from repositories/repositories_added" | if "event == installation || event == installation_repositories"
+      enforce "Use ON CONFLICT upsert to create project row if it does not exist"
+    action "Parse push event: resolve commit data and list of modified .butter files"
+    action "Enqueue file content fetch and AST compilation task into Redis / Asynq queue" | if "Commit updates files inside /.butter/"
+
+  returns
+    return 202 WebhookEnqueued | if "Valid signature and butter spec files are modified"
+    return 200 WebhookIgnored | if "Valid signature but no changes to /.butter/ directory found"
+    return 401 SignatureError | if "Webhook signature mismatch or missing cryptographic headers"
+
+listener SyncSpecJob
+  description "Compiles modified specification files asynchronously and broadcasts updates"
+  topic "spec.sync"
+
+  params
+    param RepoUrl
+      type string
+      required true
+    param CommitSha
+      type string
+      required true
+    param TargetPaths
+      type array[string]
+      required true
+
+  actions
+    action "Authenticate with GitHub App installation credentials"
+    action "Fetch raw plaintext spec content from target files"
+    action "Compile plaintext specs into structured JSON AST using Go-Peg parser"
+    action "Run complete semantic structural check for duplicated routes or feature declarations"
+    action "Update PostgreSQL cached spec representation and catalog system components"
+    action "Broadcast workspace update event and compiled AST payload to active WebSocket sessions"
+
+  returns
+    return ack | if "Specification parsed, compiled, cached, and client UI updated successfully"
+    return retry | if "GitHub Content API endpoints rate limit the backend request"
+    return dlq | if "Parsing fails permanently due to syntax grammar errors"
+
+feature GitHubAppInstallationGate
+  description "Immediately after authentication, checks if the Butter Cloud GitHub App is installed and gates the workspace until it is"
+  version "1.16.0"
+
+  params
+    param TargetRepoName
+      type string
+      required true
+    param IsAppInstalled
+      type boolean
+      required true
+
+  actions
+    action "Request backend verification of app installation state for TargetRepoName via GET /api/v1/auth/app-installation"
+      enforce "Backend falls back to GitHub API (GET /orgs/:owner/installation or GET /users/:owner/installation) if no local DB record exists"
+    action "Poll backend every 5 seconds to detect when installation completes" | if "IsAppInstalled == false"
+    action "Display a dominant setup modal containing 'Install Butter on GitHub' link with redirect_uri" | if "IsAppInstalled == false"
+      enforce "Install URL must include redirect_uri parameter pointing back to the workspace"
+    action "Clean up setup_action query params returned from GitHub on post-install redirect"
+    action "Unlock code-syncing, AST canvas manipulation, and commit actions" | if "IsAppInstalled == true"
